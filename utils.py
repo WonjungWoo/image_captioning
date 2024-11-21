@@ -3,10 +3,13 @@ import numpy as np
 import h5py
 import json
 import torch
-from scipy.misc import imread, imresize
+#from scipy.misc import imread, imresize
+from imageio import imread
 from tqdm import tqdm
 from collections import Counter
 from random import seed, choice, sample
+from seam_carving import SeamCarver
+import cv2
 
 
 def create_input_files(dataset, karpathy_json_path, image_folder, captions_per_image, min_word_freq, output_folder,
@@ -49,9 +52,11 @@ def create_input_files(dataset, karpathy_json_path, image_folder, captions_per_i
         if len(captions) == 0:
             continue
 
-        path = os.path.join(image_folder, img['filepath'], img['filename']) if dataset == 'coco' else os.path.join(
+        #path = os.path.join(image_folder, img['filepath'], img['filename']) if dataset == 'coco' else os.path.join(
+        #    image_folder, img['filename'])
+        path = os.path.join(image_folder, img['filename']) if dataset == 'coco' else os.path.join(
             image_folder, img['filename'])
-
+        
         if img['split'] in {'train', 'restval'}:
             train_image_paths.append(path)
             train_image_captions.append(captions)
@@ -93,7 +98,7 @@ def create_input_files(dataset, karpathy_json_path, image_folder, captions_per_i
             h.attrs['captions_per_image'] = captions_per_image
 
             # Create dataset inside HDF5 file to store images
-            images = h.create_dataset('images', (len(impaths), 3, 256, 256), dtype='uint8')
+            images = h.create_dataset('images', (len(impaths), 3, 500, 399), dtype='uint8')
 
             print("\nReading %s images and captions, storing to file...\n" % split)
 
@@ -112,13 +117,16 @@ def create_input_files(dataset, karpathy_json_path, image_folder, captions_per_i
                 assert len(captions) == captions_per_image
 
                 # Read images
-                img = imread(impaths[i])
+                img = cv2.imread(impaths[i]).astype(np.float64)
+                #img = imread(impaths[i])
                 if len(img.shape) == 2:
                     img = img[:, :, np.newaxis]
                     img = np.concatenate([img, img, img], axis=2)
-                img = imresize(img, (256, 256))
+                
+                #img = SeamCarver(img).save_result()
+                #img = imresize(img, (256, 256))
                 img = img.transpose(2, 0, 1)
-                assert img.shape == (3, 256, 256)
+                #assert img.shape == (3, 256, 256), f"Unexpected shape: {img.shape}"
                 assert np.max(img) <= 255
 
                 # Save image to HDF5 file
@@ -205,7 +213,7 @@ def clip_gradient(optimizer, grad_clip):
                 param.grad.data.clamp_(-grad_clip, grad_clip)
 
 
-def save_checkpoint(data_name, epoch, epochs_since_improvement, encoder, decoder, encoder_optimizer, decoder_optimizer,
+def save_checkpoint(data_name, epoch, epochs_since_improvement, resizer, resizer_optimizer,
                     bleu4, is_best):
     """
     Saves model checkpoint.
@@ -223,10 +231,8 @@ def save_checkpoint(data_name, epoch, epochs_since_improvement, encoder, decoder
     state = {'epoch': epoch,
              'epochs_since_improvement': epochs_since_improvement,
              'bleu-4': bleu4,
-             'encoder': encoder,
-             'decoder': decoder,
-             'encoder_optimizer': encoder_optimizer,
-             'decoder_optimizer': decoder_optimizer}
+             'resizer': resizer,
+             'resizer_optimizer': resizer_optimizer}
     filename = 'checkpoint_' + data_name + '.pth.tar'
     torch.save(state, filename)
     # If this checkpoint is the best so far, store a copy so it doesn't get overwritten by a worse checkpoint

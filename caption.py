@@ -10,6 +10,11 @@ import argparse
 #from scipy.misc import imread, imresize
 from imageio import imread
 from PIL import Image
+from resizer import Resizer
+from seam_carving import SeamCarver
+import cv2
+from torchvision.transforms import ToPILImage
+
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -31,17 +36,45 @@ def caption_image_beam_search(encoder, decoder, image_path, word_map, beam_size=
     vocab_size = len(word_map)
 
     # Read image and process
-    img = imread(image_path)
+    img = cv2.imread(image_path).astype(np.float64)
+    #img = imread(image_path)
     if len(img.shape) == 2:
         img = img[:, :, np.newaxis]
         img = np.concatenate([img, img, img], axis=2)
     elif img.shape[2] == 4:
         img = img[:, :, :3]
-    pil_img = Image.fromarray(img)
-    img = np.array(pil_img.resize((256, 256), Image.BILINEAR))
+    #pil_img = Image.fromarray(img)
+
+    # Initialize the SeamCarver to resize the input image before the network processes it
+    #pil_img = SeamCarver(img).save_result2("seam_carving.jpg")
+    pil_img = SeamCarver(img).save_result()
+    #print(pil_img.shape)  # Tensor의 크기
+    #print(pil_img.dtype)  # 데이터 타입
+    
+    height, _ = pil_img.shape[: 2]
+    resizer = Resizer(resizer_image_size=height)
+    transform = transforms.ToTensor()
+    img = resizer(transform(pil_img))
+    
+    #print(img.shape)  # Tensor의 크기
+    #print(img.dtype)  # 데이터 타입
+
+    #img = np.array(pil_img.resize((256, 256), Image.BILINEAR))
 #    img = imresize(img, (256, 256))
-    img = img.transpose(2, 0, 1)
-    img = img / 255.
+#    tensor_image = img.float() / 255.0
+    img = img.squeeze(0)
+    #img = img.permute(2, 0, 1)
+    #img = img / 255.
+
+    #pil_img = ToPILImage()(img.squeeze(0))
+    #plt.imshow(pil_img)
+    
+    img = img.detach()  # Detach before converting to NumPy array
+    #img = np.array(img)
+    #img = to_pil(img)
+    # PIL 이미지 확인
+    #img.show()
+    #img = img.transpose(2, 0, 1)
     img = torch.FloatTensor(img).to(device)
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
@@ -203,7 +236,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     # Load model
-    checkpoint = torch.load(args.model, map_location=str(device))
+    checkpoint = torch.load(args.model, map_location=str(device), weights_only=False)
     decoder = checkpoint['decoder']
     decoder = decoder.to(device)
     decoder.eval()

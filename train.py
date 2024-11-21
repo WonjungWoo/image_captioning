@@ -9,9 +9,11 @@ from models import Encoder, DecoderWithAttention
 from datasets import *
 from utils import *
 from nltk.translate.bleu_score import corpus_bleu
+from resizer import Resizer
+
 
 # Data parameters
-data_folder = '/media/ssd/caption data'  # folder with data files saved by create_input_files.py
+data_folder = 'data/'  # folder with data files saved by create_input_files.py
 data_name = 'coco_5_cap_per_img_5_min_word_freq'  # base name shared by data files
 
 # Model parameters
@@ -46,41 +48,39 @@ def main():
     global best_bleu4, epochs_since_improvement, checkpoint, start_epoch, fine_tune_encoder, data_name, word_map
 
     # Read word map
-    word_map_file = os.path.join(data_folder, 'WORDMAP_' + data_name + '.json')
+    word_map_file = 'pretrained/WORDMAP_coco_5_cap_per_img_5_min_word_freq.json'
     with open(word_map_file, 'r') as j:
         word_map = json.load(j)
+        
+    old_checkpoint = torch.load('pretrained/BEST_checkpoint_coco_5_cap_per_img_5_min_word_freq.pth', map_location=str(device), weights_only=False)
+    decoder = old_checkpoint['decoder']
+    decoder = decoder.to(device)
+    decoder.eval()
+    encoder = old_checkpoint['encoder']
+    encoder = encoder.to(device)
+    encoder.eval()
+
+    
+    # Pretrained weight를 사용할 경우, encoder와 decoder는 업데이트하지 않음
+    for param in encoder.parameters():
+        param.requires_grad = False
+    for param in decoder.parameters():
+        param.requires_grad = False
 
     # Initialize / load checkpoint
     if checkpoint is None:
-        decoder = DecoderWithAttention(attention_dim=attention_dim,
-                                       embed_dim=emb_dim,
-                                       decoder_dim=decoder_dim,
-                                       vocab_size=len(word_map),
-                                       dropout=dropout)
-        decoder_optimizer = torch.optim.Adam(params=filter(lambda p: p.requires_grad, decoder.parameters()),
-                                             lr=decoder_lr)
-        encoder = Encoder()
-        encoder.fine_tune(fine_tune_encoder)
-        encoder_optimizer = torch.optim.Adam(params=filter(lambda p: p.requires_grad, encoder.parameters()),
-                                             lr=encoder_lr) if fine_tune_encoder else None
+        # Optimizer 설정 (resizer만 학습)
+        resizer = Resizer().to(device)
+        resizer_optimizer = torch.optim.Adam(resizer.parameters(), lr=1e-4)
 
     else:
         checkpoint = torch.load(checkpoint)
         start_epoch = checkpoint['epoch'] + 1
         epochs_since_improvement = checkpoint['epochs_since_improvement']
         best_bleu4 = checkpoint['bleu-4']
-        decoder = checkpoint['decoder']
-        decoder_optimizer = checkpoint['decoder_optimizer']
-        encoder = checkpoint['encoder']
-        encoder_optimizer = checkpoint['encoder_optimizer']
-        if fine_tune_encoder is True and encoder_optimizer is None:
-            encoder.fine_tune(fine_tune_encoder)
-            encoder_optimizer = torch.optim.Adam(params=filter(lambda p: p.requires_grad, encoder.parameters()),
-                                                 lr=encoder_lr)
-
-    # Move to GPU, if available
-    decoder = decoder.to(device)
-    encoder = encoder.to(device)
+        resizer = checkpoint['resizer']
+        resizer_optimizer = checkpoint['resizer_optimizer']
+        resizer = resizer.to(device)
 
     # Loss function
     criterion = nn.CrossEntropyLoss().to(device)
@@ -102,23 +102,22 @@ def main():
         if epochs_since_improvement == 20:
             break
         if epochs_since_improvement > 0 and epochs_since_improvement % 8 == 0:
-            adjust_learning_rate(decoder_optimizer, 0.8)
-            if fine_tune_encoder:
-                adjust_learning_rate(encoder_optimizer, 0.8)
+            adjust_learning_rate(resizer_optimizer, 0.8)
 
         # One epoch's training
         train(train_loader=train_loader,
               encoder=encoder,
               decoder=decoder,
+              resizer=resizer,
               criterion=criterion,
-              encoder_optimizer=encoder_optimizer,
-              decoder_optimizer=decoder_optimizer,
+              resizer_optimizer=resizer_optimizer,
               epoch=epoch)
 
         # One epoch's validation
         recent_bleu4 = validate(val_loader=val_loader,
                                 encoder=encoder,
                                 decoder=decoder,
+                                resizer=resizer,
                                 criterion=criterion)
 
         # Check if there was an improvement
@@ -131,11 +130,11 @@ def main():
             epochs_since_improvement = 0
 
         # Save checkpoint
-        save_checkpoint(data_name, epoch, epochs_since_improvement, encoder, decoder, encoder_optimizer,
-                        decoder_optimizer, recent_bleu4, is_best)
+        save_checkpoint(data_name, epoch, epochs_since_improvement, encoder, decoder, resizer,
+                        recent_bleu4, is_best)
 
 
-def train(train_loader, encoder, decoder, criterion, encoder_optimizer, decoder_optimizer, epoch):
+def train(train_loader, encoder, decoder, resizer, criterion, resizer_optimizer, epoch):
     """
     Performs one epoch's training.
 
@@ -148,8 +147,9 @@ def train(train_loader, encoder, decoder, criterion, encoder_optimizer, decoder_
     :param epoch: epoch number
     """
 
-    decoder.train()  # train mode (dropout and batchnorm is used)
-    encoder.train()
+    decoder.eval()  # train mode (dropout and batchnorm is used)
+    encoder.eval()
+    resizer.train()
 
     batch_time = AverageMeter()  # forward prop. + back prop. time
     data_time = AverageMeter()  # data loading time
@@ -168,6 +168,7 @@ def train(train_loader, encoder, decoder, criterion, encoder_optimizer, decoder_
         caplens = caplens.to(device)
 
         # Forward prop.
+        resizer(imgs)
         imgs = encoder(imgs)
         scores, caps_sorted, decode_lengths, alphas, sort_ind = decoder(imgs, caps, caplens)
 
@@ -186,21 +187,15 @@ def train(train_loader, encoder, decoder, criterion, encoder_optimizer, decoder_
         loss += alpha_c * ((1. - alphas.sum(dim=1)) ** 2).mean()
 
         # Back prop.
-        decoder_optimizer.zero_grad()
-        if encoder_optimizer is not None:
-            encoder_optimizer.zero_grad()
+        resizer_optimizer.zero_grad()
         loss.backward()
 
         # Clip gradients
         if grad_clip is not None:
-            clip_gradient(decoder_optimizer, grad_clip)
-            if encoder_optimizer is not None:
-                clip_gradient(encoder_optimizer, grad_clip)
+            clip_gradient(resizer_optimizer, grad_clip)
 
         # Update weights
-        decoder_optimizer.step()
-        if encoder_optimizer is not None:
-            encoder_optimizer.step()
+        resizer_optimizer.step()
 
         # Keep track of metrics
         top5 = accuracy(scores, targets, 5)
@@ -222,7 +217,7 @@ def train(train_loader, encoder, decoder, criterion, encoder_optimizer, decoder_
                                                                           top5=top5accs))
 
 
-def validate(val_loader, encoder, decoder, criterion):
+def validate(val_loader, encoder, decoder, resizer, criterion):
     """
     Performs one epoch's validation.
 
@@ -257,8 +252,8 @@ def validate(val_loader, encoder, decoder, criterion):
             caplens = caplens.to(device)
 
             # Forward prop.
-            if encoder is not None:
-                imgs = encoder(imgs)
+            imgs = resizer(imgs)
+            imgs = encoder(imgs)
             scores, caps_sorted, decode_lengths, alphas, sort_ind = decoder(imgs, caps, caplens)
 
             # Since we decoded starting with <start>, the targets are all words after <start>, up to <end>
